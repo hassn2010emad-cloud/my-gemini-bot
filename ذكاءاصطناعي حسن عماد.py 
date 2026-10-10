@@ -1,0 +1,794 @@
+# -*- coding: utf-8 -*-
+"""
+صنع أداة القائد حسن عماد ✔️
+بوت تيليجرام متعدد الميزات: Gemini، ذاكرة SQLite، الصور، الملفات،
+الطقس، حدود الطلبات، وإحصائيات المالك.
+
+التثبيت:
+pip install -U python-telegram-bot requests pypdf
+
+الأمان:
+- ضع مفاتيحك الجديدة في المتغيرات أدناه أو كمتغيرات بيئة.
+- لا تشارك التوكنات في المحادثات أو المجموعات.
+- لا توجد أداة تستطيع ضمان التوفر الدائم أو تجاوز حصص API.
+"""
+
+import os
+import re
+import io
+import json
+import time
+import base64
+import sqlite3
+import logging
+import asyncio
+from pathlib import Path
+from typing import Optional
+
+import requests
+from telegram import Update, BotCommand
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# ============================================================
+# الإعدادات: أدخل بياناتك الجديدة هنا، أو استخدم متغيرات البيئة
+# ============================================================
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8694934580:AAGR4vl-89LhrfSYHliGLKA1HomVdUmIhok").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6Jj03m04vZaYBfJjGpGdlSQY4fZAgqzdjPxksj3lMSitQ").strip()
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.5-flash-lite"
+).strip()
+
+# ضع رقم حساب تيليجرام الخاص بك لتفعيل أوامر المالك.
+# يمكنك معرفة رقمك عبر بوت موثوق مثل @userinfobot، ولا تضع اسم المستخدم هنا.
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+
+APP_NAME = "صنع أداة القائد حسن عماد ✔️"
+DB_PATH = os.getenv("BOT_DB_PATH", "qaid_hassan_bot.sqlite3")
+GEMINI_TIMEOUT = 60
+MAX_INPUT_CHARS = 12000
+MAX_HISTORY_MESSAGES = 12
+MAX_TELEGRAM_CHUNK = 3900
+RATE_LIMIT_SECONDS = 3.0
+DAILY_REQUEST_LIMIT = 80  # لكل مستخدم؛ عدّله بما يناسب حصتك
+MAX_DOWNLOAD_BYTES = 12 * 1024 * 1024
+MAX_DOCUMENT_TEXT = 18000
+MAX_IMAGE_BYTES = 7 * 1024 * 1024
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("QaidHassanBot")
+
+# ============================================================
+# قاعدة البيانات
+# ============================================================
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                first_name TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                first_seen REAL NOT NULL,
+                last_seen REAL NOT NULL,
+                requests_total INTEGER NOT NULL DEFAULT 0,
+                blocked INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_user_id
+            ON messages(user_id, id)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO settings(key, value)
+            VALUES('maintenance', '0')
+        """)
+        conn.commit()
+
+
+def touch_user(user):
+    now = time.time()
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT INTO users(user_id, first_name, username, first_seen, last_seen)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                first_name=excluded.first_name,
+                username=excluded.username,
+                last_seen=excluded.last_seen
+        """, (
+            user.id,
+            user.first_name or "",
+            user.username or "",
+            now,
+            now,
+        ))
+        conn.commit()
+
+
+def is_blocked(user_id: int) -> bool:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT blocked FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        return bool(row["blocked"]) if row else False
+
+
+def set_blocked(user_id: int, blocked: bool):
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE users SET blocked=? WHERE user_id=?",
+            (1 if blocked else 0, user_id),
+        )
+        conn.commit()
+
+
+def get_history(user_id: int):
+    with db_connect() as conn:
+        rows = conn.execute("""
+            SELECT role, content FROM (
+                SELECT id, role, content FROM messages
+                WHERE user_id=? ORDER BY id DESC LIMIT ?
+            ) ORDER BY id ASC
+        """, (user_id, MAX_HISTORY_MESSAGES)).fetchall()
+    return [
+        {"role": row["role"], "parts": [{"text": row["content"]}]}
+        for row in rows
+    ]
+
+
+def add_history_pair(user_id: int, prompt: str, answer: str):
+    now = time.time()
+    with db_connect() as conn:
+        conn.executemany("""
+            INSERT INTO messages(user_id, role, content, created_at)
+            VALUES(?, ?, ?, ?)
+        """, [
+            (user_id, "user", prompt, now),
+            (user_id, "model", answer, now),
+        ])
+        # احتفظ بآخر 30 رسالة لكل مستخدم لتجنب تضخم قاعدة البيانات
+        conn.execute("""
+            DELETE FROM messages WHERE user_id=? AND id NOT IN (
+                SELECT id FROM messages WHERE user_id=?
+                ORDER BY id DESC LIMIT 30
+            )
+        """, (user_id, user_id))
+        conn.execute("""
+            UPDATE users SET requests_total=requests_total+1
+            WHERE user_id=?
+        """, (user_id,))
+        conn.commit()
+
+
+def clear_history(user_id: int):
+    with db_connect() as conn:
+        conn.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
+        conn.commit()
+
+
+def setting_get(key: str, default: str = "") -> str:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def setting_set(key: str, value: str):
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT INTO settings(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (key, value))
+        conn.commit()
+
+
+def owner_only(user_id: int) -> bool:
+    return OWNER_ID != 0 and user_id == OWNER_ID
+
+
+# ============================================================
+# حدود الطلبات
+# ============================================================
+
+_last_request = {}
+_daily_counts = {}
+
+
+def check_rate_limit(user_id: int):
+    now = time.time()
+    last = _last_request.get(user_id, 0)
+    if now - last < RATE_LIMIT_SECONDS:
+        return False, "تمهّل قليلاً بين الرسائل حتى لا تتعطل الخدمة."
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    key = (user_id, day)
+    count = _daily_counts.get(key, 0)
+    if count >= DAILY_REQUEST_LIMIT:
+        return False, f"وصلت إلى حدك اليومي التجريبي ({DAILY_REQUEST_LIMIT} طلباً)."
+    _last_request[user_id] = now
+    _daily_counts[key] = count + 1
+    # إزالة عدادات الأيام القديمة من الذاكرة
+    for old_key in list(_daily_counts):
+        if old_key[1] != day:
+            _daily_counts.pop(old_key, None)
+    return True, ""
+
+
+# ============================================================
+# Gemini: نصوص وصور وصوت وملفات
+# ============================================================
+
+def gemini_generate(user_id: int, user_text: str, inline_data: Optional[dict] = None):
+    if not GEMINI_API_KEY or GEMINI_API_KEY.startswith("PUT_"):
+        return "⚠️ أضف مفتاح Gemini الجديد في إعدادات الملف أولاً."
+
+    contents = get_history(user_id)
+    parts = [{"text": user_text}]
+    if inline_data:
+        parts.append({"inline_data": inline_data})
+    contents.append({"role": "user", "parts": parts})
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent"
+    )
+    payload = {
+        "system_instruction": {
+            "parts": [{
+                "text": (
+                    "أنت مساعد مفيد ضمن بوت تيليجرام اسمه "
+                    "صنع أداة القائد حسن عماد. أجب بوضوح وباللغة المناسبة "
+                    "للمستخدم. إذا لم تعرف شيئاً فقل ذلك بصدق."
+                )
+            }]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 2048,
+        },
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": GEMINI_API_KEY,
+            },
+            json=payload,
+            timeout=GEMINI_TIMEOUT,
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            return "⚠️ الخادم أرسل استجابة غير مفهومة."
+
+        if response.status_code != 200:
+            err = data.get("error", {})
+            msg = err.get("message", "خطأ غير معروف")
+            logger.warning("Gemini HTTP %s: %s", response.status_code, msg)
+            if response.status_code == 400:
+                return "⚠️ الطلب غير مقبول. تحقق من صيغة الملف أو اسم النموذج."
+            if response.status_code == 401 or response.status_code == 403:
+                return "🔑 مفتاح Gemini غير صالح أو لا يملك صلاحية الوصول."
+            if response.status_code == 404:
+                return (
+                    f"النموذج {GEMINI_MODEL} غير متاح. غيّر GEMINI_MODEL "
+                    "إلى نموذج موجود في قائمة نماذج Google AI Studio."
+                )
+            if response.status_code == 429:
+                return "⏳ تم بلوغ حد الطلبات أو الحصة. انتظر ثم أعد المحاولة."
+            return "⚠️ تعذّر إكمال الطلب. راجع سجل التشغيل."
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            feedback = data.get("promptFeedback", {})
+            return "لم يُرجع النموذج إجابة. " + str(feedback)[:500]
+
+        answer_parts = candidates[0].get("content", {}).get("parts", [])
+        answer = "\n".join(
+            p.get("text", "") for p in answer_parts if p.get("text")
+        ).strip()
+        return answer or "وصل رد فارغ من النموذج."
+
+    except requests.Timeout:
+        return "⏱️ انتهت مهلة الاتصال. حاول مرة أخرى."
+    except requests.RequestException:
+        logger.exception("Gemini connection error")
+        return "🌐 تعذّر الاتصال بـ Gemini. افحص الإنترنت."
+    except Exception:
+        logger.exception("Unexpected Gemini error")
+        return "حدث خطأ غير متوقع أثناء معالجة الطلب."
+
+
+async def telegram_reply_long(message, text: str):
+    text = text or "لا يوجد نص للعرض."
+    for start in range(0, len(text), MAX_TELEGRAM_CHUNK):
+        await message.reply_text(text[start:start + MAX_TELEGRAM_CHUNK])
+
+
+async def ask_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        prompt: str, inline_data: Optional[dict] = None):
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+
+    touch_user(user)
+
+    if is_blocked(user.id):
+        await message.reply_text("تم إيقاف استخدامك لهذا البوت. إذا تعتقد أن هذا خطأ فتواصل مع المالك.")
+        return
+
+    if setting_get("maintenance", "0") == "1" and not owner_only(user.id):
+        await message.reply_text("🛠️ البوت تحت الصيانة حالياً. حاول لاحقاً.")
+        return
+
+    allowed, reason = check_rate_limit(user.id)
+    if not allowed and not owner_only(user.id):
+        await message.reply_text(reason)
+        return
+
+    await context.bot.send_chat_action(
+        chat_id=message.chat_id, action=ChatAction.TYPING
+    )
+    answer = await asyncio.to_thread(
+        gemini_generate, user.id, prompt, inline_data
+    )
+
+    # احفظ النصوص العادية الناجحة فقط، ولا تحفظ رسائل أخطاء الخدمة
+    if answer and not answer.startswith(("⚠️", "🔑", "⏳", "⏱️", "🌐", "حدث خطأ")):
+        add_history_pair(user.id, prompt, answer)
+
+    await telegram_reply_long(message, answer)
+
+
+# ============================================================
+# أوامر المستخدم
+# ============================================================
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user:
+        touch_user(user)
+    await update.effective_message.reply_text(
+        f"🤖 {APP_NAME}\n\n"
+        "أهلاً بك! أنا مساعدك الذكي متعدد المهام.\n\n"
+        "🧠 أجب عن أسئلتك مع ذاكرة محادثة محفوظة.\n"
+        "🖼️ أرسل صورة واسأل عنها.\n"
+        "📄 أرسل TXT أو PDF لاستخراج النص وتحليله.\n"
+        "🎙️ أرسل ملف صوت مدعوم لطلب تفريغه أو تلخيصه.\n"
+        "🌦️ استخدم /weather بغداد لمعرفة الطقس.\n\n"
+        "الأوامر:\n"
+        "/help - قائمة المساعدة\n"
+        "/clear - مسح ذاكرة محادثتك\n"
+        "/weather مدينة - الطقس\n"
+        "/me - معلومات استخدامك"
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "📚 أوامر البوت\n"
+        "/start — بدء الاستخدام\n"
+        "/help — المساعدة\n"
+        "/clear — مسح ذاكرة المحادثة\n"
+        "/me — إحصائياتك\n"
+        "/weather بغداد — حالة الطقس\n\n"
+        "أرسل رسالة نصية للسؤال، أو صورة مع وصف، أو ملف TXT/PDF.\n"
+        "بعض الوظائف تعتمد على دعم نموذج Gemini وحصتك المتاحة."
+    )
+
+
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user:
+        clear_history(user.id)
+    await update.effective_message.reply_text("🧹 تم مسح ذاكرة محادثتك المحفوظة.")
+
+
+async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT requests_total, first_seen FROM users WHERE user_id=?",
+            (user.id,),
+        ).fetchone()
+    total = row["requests_total"] if row else 0
+    await update.effective_message.reply_text(
+        f"👤 حسابك: {user.first_name}\n"
+        f"🆔 رقم المستخدم: {user.id}\n"
+        f"📊 الطلبات الناجحة المسجلة: {total}\n"
+        f"🧠 رسائل الذاكرة: {len(get_history(user.id))}"
+    )
+
+
+# ============================================================
+# الطقس عبر Open-Meteo (لا يحتاج مفتاحاً)
+# ============================================================
+
+def fetch_weather(city: str):
+    geo = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": city, "count": 1, "language": "ar", "format": "json"},
+        timeout=15,
+    )
+    geo.raise_for_status()
+    results = geo.json().get("results", [])
+    if not results:
+        return None
+    place = results[0]
+    weather = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m",
+            "timezone": "auto",
+        },
+        timeout=15,
+    )
+    weather.raise_for_status()
+    current = weather.json().get("current", {})
+    return place, current
+
+
+async def weather_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    city = " ".join(context.args).strip()
+    if not city:
+        await update.effective_message.reply_text("اكتب المدينة هكذا: /weather بغداد")
+        return
+    try:
+        result = await asyncio.to_thread(fetch_weather, city)
+        if not result:
+            await update.effective_message.reply_text("لم أجد هذه المدينة. جرّب اسماً آخر.")
+            return
+        place, current = result
+        text = (
+            f"🌦️ الطقس الحالي في {place.get('name', city)}"
+            f" - {place.get('country', '')}\n\n"
+            f"🌡️ الحرارة: {current.get('temperature_2m', '؟')}°C\n"
+            f"🤗 المحسوسة: {current.get('apparent_temperature', '؟')}°C\n"
+            f"💧 الرطوبة: {current.get('relative_humidity_2m', '؟')}%\n"
+            f"💨 سرعة الرياح: {current.get('wind_speed_10m', '؟')} كم/س\n\n"
+            "المصدر: Open-Meteo"
+        )
+        await update.effective_message.reply_text(text)
+    except Exception:
+        logger.exception("Weather error")
+        await update.effective_message.reply_text("تعذّر جلب الطقس حالياً.")
+
+
+# ============================================================
+# الصور والملفات والصوت
+# ============================================================
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not message.photo:
+        return
+    photo = message.photo[-1]
+    if photo.file_size and photo.file_size > MAX_IMAGE_BYTES:
+        await message.reply_text("الصورة كبيرة جداً. أرسل صورة أصغر.")
+        return
+    caption = message.caption or "صف هذه الصورة واشرح العناصر المهمة فيها."
+    try:
+        tg_file = await context.bot.get_file(photo.file_id)
+        stream = io.BytesIO()
+        await tg_file.download_to_memory(out=stream)
+        raw = stream.getvalue()
+        if len(raw) > MAX_IMAGE_BYTES:
+            await message.reply_text("حجم الصورة أكبر من الحد المسموح.")
+            return
+        inline = {
+            "mime_type": "image/jpeg",
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+        await ask_and_reply(update, context, caption, inline)
+    except Exception:
+        logger.exception("Photo handling error")
+        await message.reply_text("تعذّر تحليل الصورة. حاول صورة أخرى.")
+
+
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not message.document:
+        return
+
+    doc = message.document
+    filename = doc.file_name or "file"
+    ext = Path(filename).suffix.lower()
+
+    if doc.file_size and doc.file_size > MAX_DOWNLOAD_BYTES:
+        await message.reply_text("حجم الملف كبير. الحد الأقصى 12 ميغابايت.")
+        return
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        stream = io.BytesIO()
+        await tg_file.download_to_memory(out=stream)
+        raw = stream.getvalue()
+        if len(raw) > MAX_DOWNLOAD_BYTES:
+            await message.reply_text("حجم الملف أكبر من الحد المسموح.")
+            return
+
+        if ext in (".txt", ".md", ".csv", ".json", ".py", ".html", ".log"):
+            text = raw.decode("utf-8", errors="replace")
+        elif ext == ".pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(raw))
+                text = "\n".join((page.extract_text() or "") for page in reader.pages)
+            except ImportError:
+                await message.reply_text("لقراءة PDF ثبّت المكتبة: pip install pypdf")
+                return
+            except Exception:
+                logger.exception("PDF extraction error")
+                await message.reply_text("تعذّر استخراج النص من ملف PDF.")
+                return
+        else:
+            await message.reply_text(
+                "نوع الملف غير مدعوم حالياً. أرسل PDF أو TXT أو MD أو CSV أو JSON أو PY أو HTML."
+            )
+            return
+
+        text = text[:MAX_DOCUMENT_TEXT].strip()
+        if not text:
+            await message.reply_text("لم أجد نصاً قابلاً للاستخراج من الملف.")
+            return
+
+        instruction = message.caption or "لخّص الملف واشرح أهم النقاط وأجب عن أي أسئلة مفيدة."
+        prompt = (
+            f"اسم الملف: {filename}\n"
+            f"تعليمات المستخدم: {instruction}\n\n"
+            f"محتوى الملف (قد يكون مقتطعاً إذا كان طويلاً):\n{text}"
+        )
+        await ask_and_reply(update, context, prompt)
+    except Exception:
+        logger.exception("Document handling error")
+        await message.reply_text("تعذّرت معالجة الملف.")
+
+
+async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+
+    audio_obj = message.voice or message.audio
+    if not audio_obj:
+        return
+    size = getattr(audio_obj, "file_size", None)
+    if size and size > MAX_DOWNLOAD_BYTES:
+        await message.reply_text("ملف الصوت كبير جداً. أرسل ملفاً أصغر.")
+        return
+
+    mime = getattr(audio_obj, "mime_type", None) or "audio/ogg"
+    if mime not in ("audio/ogg", "audio/mpeg", "audio/mp3", "audio/wav", "audio/aac", "audio/mp4", "audio/webm"):
+        # لا نفترض أن كل أنواع الصوت مدعومة
+        mime = "audio/ogg" if message.voice else "audio/mpeg"
+
+    try:
+        tg_file = await context.bot.get_file(audio_obj.file_id)
+        stream = io.BytesIO()
+        await tg_file.download_to_memory(out=stream)
+        raw = stream.getvalue()
+        if len(raw) > MAX_DOWNLOAD_BYTES:
+            await message.reply_text("ملف الصوت أكبر من الحد المسموح.")
+            return
+        inline = {
+            "mime_type": mime,
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+        prompt = (
+            message.caption
+            or "فرّغ الكلام الموجود في هذا التسجيل إلى نص، ثم لخّصه باختصار. "
+               "إذا لم يكن فيه كلام واضح، أخبرني بذلك."
+        )
+        await ask_and_reply(update, context, prompt, inline)
+    except Exception:
+        logger.exception("Audio handling error")
+        await message.reply_text("تعذّر تحليل الصوت. جرّب ملفاً أقصر أو صيغة مدعومة.")
+
+
+# ============================================================
+# أوامر المالك
+# ============================================================
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    if not owner_only(user.id):
+        await message.reply_text("هذا الأمر مخصص لمالك البوت.")
+        return
+
+    with db_connect() as conn:
+        users = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+        requests_total = conn.execute(
+            "SELECT COALESCE(SUM(requests_total), 0) AS n FROM users"
+        ).fetchone()["n"]
+        blocked = conn.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE blocked=1"
+        ).fetchone()["n"]
+
+    maintenance = setting_get("maintenance", "0")
+    await message.reply_text(
+        f"👑 لوحة المالك — {APP_NAME}\n\n"
+        f"👥 عدد المستخدمين: {users}\n"
+        f"📊 الطلبات المسجلة: {requests_total}\n"
+        f"🚫 الحسابات الموقوفة: {blocked}\n"
+        f"🛠️ وضع الصيانة: {'مفعّل' if maintenance == '1' else 'متوقف'}\n"
+        f"🧠 النموذج: {GEMINI_MODEL}\n\n"
+        "أوامر المالك:\n"
+        "/maintenance_on — تشغيل الصيانة\n"
+        "/maintenance_off — إيقاف الصيانة\n"
+        "/block USER_ID — إيقاف مستخدم\n"
+        "/unblock USER_ID — إعادة تفعيل مستخدم"
+    )
+
+
+async def maintenance_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not owner_only(user.id):
+        await update.effective_message.reply_text("هذا الأمر مخصص للمالك.")
+        return
+    setting_set("maintenance", "1")
+    await update.effective_message.reply_text("🛠️ تم تشغيل وضع الصيانة.")
+
+
+async def maintenance_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not owner_only(user.id):
+        await update.effective_message.reply_text("هذا الأمر مخصص للمالك.")
+        return
+    setting_set("maintenance", "0")
+    await update.effective_message.reply_text("✅ تم إيقاف وضع الصيانة.")
+
+
+async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not owner_only(user.id):
+        await update.effective_message.reply_text("هذا الأمر مخصص للمالك.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الاستخدام: /block USER_ID")
+        return
+    target = int(context.args[0])
+    set_blocked(target, True)
+    await update.effective_message.reply_text(f"تم إيقاف المستخدم {target} إذا كان مسجلاً.")
+
+
+async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not owner_only(user.id):
+        await update.effective_message.reply_text("هذا الأمر مخصص للمالك.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الاستخدام: /unblock USER_ID")
+        return
+    target = int(context.args[0])
+    set_blocked(target, False)
+    await update.effective_message.reply_text(f"تمت إعادة تفعيل المستخدم {target} إذا كان مسجلاً.")
+
+
+async def post_init(application: Application):
+    commands = [
+        BotCommand("start", "تشغيل البوت"),
+        BotCommand("help", "المساعدة"),
+        BotCommand("clear", "مسح ذاكرة المحادثة"),
+        BotCommand("me", "معلومات الاستخدام"),
+        BotCommand("weather", "الطقس حسب المدينة"),
+        BotCommand("admin", "لوحة تحكم المالك"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Bot commands registered")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled Telegram error", exc_info=context.error)
+
+
+def main():
+    print("=" * 58)
+    print(APP_NAME)
+    print("بدء فحص الإعدادات...")
+    print("=" * 58)
+
+    if not BOT_TOKEN or BOT_TOKEN.startswith("PUT_"):
+        raise SystemExit(
+            "خطأ: ضع توكن تيليجرام الجديد في BOT_TOKEN أعلى الملف."
+        )
+    if not GEMINI_API_KEY or GEMINI_API_KEY.startswith("PUT_"):
+        raise SystemExit(
+            "خطأ: ضع مفتاح Gemini في GEMINI_API_KEY أعلى الملف."
+        )
+    if OWNER_ID == 0:
+        print("تنبيه: OWNER_ID غير مضبوط؛ أوامر المالك لن تعمل.")
+
+    init_db()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(CommandHandler("me", me_cmd))
+    app.add_handler(CommandHandler("weather", weather_cmd))
+
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("maintenance_on", maintenance_on_cmd))
+    app.add_handler(CommandHandler("maintenance_off", maintenance_off_cmd))
+    app.add_handler(CommandHandler("block", block_cmd))
+    app.add_handler(CommandHandler("unblock", unblock_cmd))
+
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, audio_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_error_handler(error_handler)
+
+    print("تم تجهيز البوت. جاري الاتصال بتيليجرام...")
+    app.run_polling(drop_pending_updates=False)
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if not message or not message.text:
+        return
+    prompt = message.text.strip()
+    if not prompt:
+        return
+    if len(prompt) > MAX_INPUT_CHARS:
+        await message.reply_text(
+            f"رسالتك طويلة جداً. الحد الأقصى {MAX_INPUT_CHARS} حرف."
+        )
+        return
+    await ask_and_reply(update, context, prompt)
+
+
+if __name__ == "__main__":
+    main()
